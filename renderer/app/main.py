@@ -331,89 +331,74 @@ def render(payload: RenderPayload, authorization: Optional[str] = Header(None)):
         except requests.RequestException as e:
             raise Fail(f"FETCH_ERROR: audio HEAD failed: {e}")
 
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
+        # ↓↓↓ everything happens inside this tempdir ↓↓↓
+        with tempfile.TemporaryDirectory() as td_str:
+            td = Path(td_str)
 
-        # Download JSON assets (track paths)
-        ev = nar = cx = None
-        json_list = [
-            ("events", str(payload.assets.eventsUrl)),
-            ("narration", str(payload.assets.narrationUrl)),
-            ("complexity", str(payload.assets.complexityUrl)),
-        ]
-        for kind, url in json_list:
-            try:
-                name = infer_asset_filename(url, default=f"{kind}.json")
-                dest = td / name
-                download(url, dest)
-                if kind == "events": ev = dest
-                elif kind == "narration": nar = dest
-                else: cx = dest
-            except Exception as e:
-                print("WARN: JSON asset fetch failed:", url, e)
+            # Download JSON assets
+            ev = nar = cx = None
+            for kind, url in [
+                ("events", str(payload.assets.eventsUrl)),
+                ("narration", str(payload.assets.narrationUrl)),
+                ("complexity", str(payload.assets.complexityUrl)),
+            ]:
+                try:
+                    name = infer_asset_filename(url, default=f"{kind}.json")
+                    dest = td / name
+                    download(url, dest)
+                    if kind == "events": ev = dest
+                    elif kind == "narration": nar = dest
+                    else: cx = dest
+                except Exception as e:
+                    print("WARN: JSON asset fetch failed:", url, e)
 
-        # Download audio (required)
-        audio_files: List[Path] = []
-        for i, aurl in enumerate(payload.assets.audioUrls):
-            aurl = str(aurl)
-            try:
-                # use key’s basename to get extension (e.g., 000.mp3)
+            # Download per-scene audio
+            audio_files: List[Path] = []
+            for i, aurl in enumerate(payload.assets.audioUrls):
+                aurl = str(aurl)
                 name = infer_asset_filename(aurl, default=f"{i:03d}.mp3")
                 ext = Path(name).suffix or ".mp3"
                 p = td / f"{i:03d}{ext}"
                 download(aurl, p)
                 audio_files.append(p)
-            except Exception as e:
-                raise Fail(f"FETCH_ERROR: audio {i} GET failed: {e}")
 
+            if not audio_files:
+                raise Fail("VALIDATION_ERROR: no audio files")
 
-        if not audio_files:
-            raise Fail("VALIDATION_ERROR: no audio files")
-
-        # Concat audio
-        out_audio = td / "combined.m4a"
-        try:
+            # Concat total audio (fallback only)
+            out_audio = td / "combined.m4a"
             assemble_audio(audio_files, out_audio)
-        except Exception as e:
-            raise Fail(f"AUDIO_ERROR: {e}")
 
-        # Compute total duration (fallback 2s/clip)
-        durations = [(ffprobe_duration(p) or 2.0) for p in audio_files]
-        total = max(sum(durations), 1.0)
-
-
-        # Make video (prefer Manim if events.json is present)
-        out_mp4 = td / "out.mp4"
-        try:
-            use_manim = os.getenv("USE_MANIM", "1") == "1" and ev and audio_files
-            if use_manim:
-                # Manim scenes timed to each per-clip WAV/MP3
-                render_manim(ev, audio_files, out_mp4)
-            else:
-                # fallback: simple black background
+            # Render (prefer Manim)
+            out_mp4 = td / "out.mp4"
+            try:
+                use_manim = os.getenv("USE_MANIM", "1") == "1" and ev and audio_files
+                if use_manim:
+                    render_manim(ev, audio_files, out_mp4)
+                else:
+                    total = sum((ffprobe_duration(p) or 2.0) for p in audio_files)
+                    make_video(total, out_audio, out_mp4)
+            except Exception as e:
+                print("WARN: manim render failed, falling back:", e)
+                total = sum((ffprobe_duration(p) or 2.0) for p in audio_files)
                 make_video(total, out_audio, out_mp4)
-        except Exception as e:
-            # hard fallback on any Manim failure
-            print("WARN: manim render failed, falling back:", e)
-            make_video(total, out_audio, out_mp4)
 
-        if LOCAL:
-            out_dir = Path(os.getenv("LOCAL_OUTPUT_DIR", "/output"))
-            out_dir.mkdir(parents=True, exist_ok=True)
-            local_name = f"{job_id}.mp4"
-            local_path = out_dir / local_name
-            shutil.copy2(out_mp4, local_path)
-            return {"ok": True, "jobId": job_id, "localPath": str(local_path)}
-        # Upload to Stream (TUS)
-        try:
-            # uid = tus_upload(upload_url, out_mp4, filename=f"{job_id}.mp4")
-            uid = basic_upload(upload_url, out_mp4)  # direct creator upload (basic)
-        except Exception as e:
-            raise Fail(f"UPLOAD_ERROR: {e}")
+            if LOCAL:
+                out_dir = Path(os.getenv("LOCAL_OUTPUT_DIR", "/output")); out_dir.mkdir(parents=True, exist_ok=True)
+                local_path = out_dir / f"{job_id}.mp4"
+                shutil.copy2(out_mp4, local_path)
+                return {"ok": True, "jobId": job_id, "localPath": str(local_path)}
 
-        playback = f"https://watch.cloudflarestream.com/{uid}"
-        backend_callback(job_id, "done", "ok", uid, playback)
-        return {"ok": True, "jobId": job_id, "streamUid": uid, "playbackUrl": playback}
+            # Upload to Stream (basic direct upload)
+            try:
+                uid = basic_upload(upload_url, out_mp4)
+            except Exception as e:
+                raise Fail(f"UPLOAD_ERROR: {e}")
+
+            playback = f"https://watch.cloudflarestream.com/{uid}"
+            backend_callback(job_id, "done", "ok", uid, playback)
+            return {"ok": True, "jobId": job_id, "streamUid": uid, "playbackUrl": playback}
+
 
     except ValidationError as e:
         msg = f"VALIDATION_ERROR: {e.errors()[0]['msg'] if e.errors() else 'invalid payload'}"

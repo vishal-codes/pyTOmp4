@@ -186,7 +186,9 @@ def _concat(clips: List[Path], out_path: Path):
 
 def render_manim(events_json: Path, audio_files: List[Path], out_mp4: Path):
     apply_manim_defaults()
+
     raw = _load_events_any(events_json)
+    root = raw if isinstance(raw, dict) else None  # keep the whole root for nums/metadata
     events = normalize_events(raw)
 
     pairs = list(zip(events, audio_files))[:min(len(events), len(audio_files))]
@@ -197,9 +199,9 @@ def render_manim(events_json: Path, audio_files: List[Path], out_mp4: Path):
     ok = 0
     for i, (ev, aud) in enumerate(pairs):
         try:
-            SceneCls, args = coerce_args(ev, events_root=events_json)
+            # ❌ was: events_root=events_json (a Path)
+            SceneCls, args = coerce_args(ev, events_root=root)
             a_dur = max(0.2, _ffprobe_duration(aud))
-            # drive visuals from audio + tiny tail for breathing room
             d = max(MIN_SCENE, a_dur + TAIL_PAD)
 
             vid = out_mp4.parent / f"clip_{i:03d}.mp4"
@@ -207,7 +209,6 @@ def render_manim(events_json: Path, audio_files: List[Path], out_mp4: Path):
 
             _render_scene(SceneCls, args, d, vid)
 
-            # pad audio so it's >= video duration; then mux w/o -shortest
             padded = aud.with_suffix(".padded.m4a")
             _pad_audio_to(aud, padded, d)
             _mux(vid, padded, av)
@@ -216,19 +217,19 @@ def render_manim(events_json: Path, audio_files: List[Path], out_mp4: Path):
             ok += 1
         except Exception as e:
             print(f"WARN: scene {i} failed: {e}")
-            # fallback text card so timeline stays aligned
             d = max(MIN_SCENE, _ffprobe_duration(aud) + TAIL_PAD)
-            vid = out_mp4.parent  / f"clip_{i:03d}.mp4"
+            vid = out_mp4.parent / f"clip_{i:03d}.mp4"
             _render_scene(Callout, {"text": "Step"}, d, vid)
             padded = aud.with_suffix(".padded.m4a")
             _pad_audio_to(aud, padded, d)
-            av = out_mp4.parent  / f"clip_{i:03d}_av.mp4"
+            av = out_mp4.parent / f"clip_{i:03d}_av.mp4"
             _mux(vid, padded, av)
             clips.append(av)
 
     if ok == 0:
         raise RuntimeError("no scenes rendered")
     _concat(clips, out_mp4)
+
 
 def coerce_args(ev: dict, events_root: dict | None = None):
     t = (ev.get("t") or ev.get("type") or "").lower()
