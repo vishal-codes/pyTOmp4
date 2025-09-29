@@ -96,6 +96,7 @@ import tempfile
 
 MIN_SCENE = float(os.getenv("MIN_SCENE", "1.2"))
 TAIL_PAD  = float(os.getenv("TAIL_PAD", "0.25"))
+PACE_MULT = float(os.getenv("PACE_MULT", "1.0"))
 
 def _pad_audio_to(a_in: Path, a_out: Path, target_sec: float):
     """Append silence if needed so audio >= target_sec."""
@@ -199,7 +200,6 @@ def render_manim(events_json: Path, audio_files: List[Path], out_mp4: Path):
     ok = 0
     for i, (ev, aud) in enumerate(pairs):
         try:
-            # ❌ was: events_root=events_json (a Path)
             SceneCls, args = coerce_args(ev, events_root=root)
             a_dur = max(0.2, _ffprobe_duration(aud))
             d = max(MIN_SCENE, a_dur + TAIL_PAD)
@@ -210,7 +210,7 @@ def render_manim(events_json: Path, audio_files: List[Path], out_mp4: Path):
             _render_scene(SceneCls, args, d, vid)
 
             padded = aud.with_suffix(".padded.m4a")
-            _pad_audio_to(aud, padded, d)
+            _pad_audio_to(aud, padded, d * PACE_MULT)
             _mux(vid, padded, av)
 
             clips.append(av)
@@ -230,52 +230,3 @@ def render_manim(events_json: Path, audio_files: List[Path], out_mp4: Path):
         raise RuntimeError("no scenes rendered")
     _concat(clips, out_mp4)
 
-
-def coerce_args(ev: dict, events_root: dict | None = None):
-    t = (ev.get("t") or ev.get("type") or "").lower()
-    nums = None
-    if events_root:
-        nums = (events_root.get("input") or {}).get("nums")
-
-    def pointers_from(e):
-        p = e.get("pointers") or {}
-        return {
-            "left":  e.get("left",  p.get("left")),
-            "mid":   e.get("mid",   p.get("mid")),
-            "right": e.get("right", p.get("right")),
-        }
-
-    if t in ("titlecard", "title_card"):
-        return TitleCard, {"text": ev.get("text") or "Algorithm"}
-
-    if t in ("arraytape", "array_tape"):
-        ptrs = pointers_from(ev)
-        hi = []
-        if isinstance(ptrs.get("mid"), int):
-            hi = [ptrs["mid"]]
-        return ArrayTape, {
-            "values": nums or [],          # <— ensure values are always set
-            "pointers": ptrs,
-            "highlight": hi,
-        }
-
-    if t in ("movepointer", "move_pointer"):
-        which = ev.get("which", "pointer")
-        to = ev.get("to", "?")
-        txt = f"Move {which} to index {to}"
-        return Callout, {"text": txt}     # <— safe overlay, no state
-
-    if t in ("complexitycard", "complexity_card"):
-        return ComplexityCard, {
-            "time":  ev.get("time")  or ev.get("time_complexity"),
-            "space": ev.get("space") or ev.get("space_complexity"),
-        }
-
-    if t in ("resultcard", "result_card"):
-        return ResultCard, {"text": ev.get("text") or "Done"}
-
-    if t == "callout":
-        return Callout, {"text": ev.get("text") or "Note"}
-
-    # fallback: never crash
-    return Callout, {"text": "Step"}

@@ -196,5 +196,5 @@ curl -s -X POST http://127.0.0.1:8000/render \
   --data @payload2.json | jq
 
 # open the local file printed by the renderer (e.g. /output/<job>.mp4)
-sudo docker run --rm --network=host -e RENDER_TOKEN=dev-render-token -e BACKEND_BASE_URL=http://127.0.0.1:8787 -e CALLBACK_TOKEN="$(grep -E '^CALLBACK_TOKEN=' ../backend/.dev.vars | cut -d= -f2-)" -e USE_MANIM=1 -e SKIP_STREAM=0 -e MIN_SCENE=1.4 -e TAIL_PAD=0.35 -e PACE_MULT=1.6 pytomp4-renderer
+sudo docker run --rm --network=host -e RENDER_TOKEN=dev-render-token -e BACKEND_BASE_URL=http://127.0.0.1:8787 -e CALLBACK_TOKEN="$(grep -E '^CALLBACK_TOKEN=' ../backend/.dev.vars | cut -d= -f2-)" -e USE_MANIM=1 -e SKIP_STREAM=0 -e MIN_SCENE=1.4 -e TAIL_PAD=0.35 -e PACE_MULT=1.0 pytomp4-renderer
 
