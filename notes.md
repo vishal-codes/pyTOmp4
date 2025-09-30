@@ -128,6 +128,42 @@ sudo docker run --rm --network=host \
 
 
 
+# A) Create a job with your code
+JOB=$(curl -s -X POST http://127.0.0.1:8787/api/jobs \
+  -H 'content-type: application/json' \
+  -d @- <<'JSON' | jq -r .jobId
+{
+  "code": "def answer(nums, target):\n    left, right = 0, len(nums) - 1\n    while left <= right:\n        mid = (left + right) // 2\n        if nums[mid] == target:\n            return mid\n        if nums[left] <= nums[mid]:\n            if nums[left] <= target < nums[mid]:\n                right = mid - 1\n            else:\n                left = mid + 1\n        else:\n            if nums[mid] < target <= nums[right]:\n                left = mid + 1\n            else:\n                right = mid - 1\n    return -1",
+  "language": "python"
+}
+JSON
+)
+
+echo "JOB=$JOB"
+
+# B) Wait until PREP is done and assets are in R2
+#    (repeat this until you see events.json, narration.json, sync.json AND audio/000.* present)
+curl -s "http://127.0.0.1:8787/debug/r2/list?prefix=jobs/$JOB/" | jq
+
+# C) Build the render payload from the debug endpoint
+curl -s "http://127.0.0.1:8787/debug/render-payload/$JOB" > payload.json
+
+# D) Confirm the asset counts
+jq '{scenes:(.assets.eventsUrl|tostring), audio_count:(.assets.audioUrls|length), sync:(.assets.syncUrl|tostring)}' payload.json
+
+# E) Get a Cloudflare Stream Direct Upload URL and insert it
+DU=$(curl -s http://127.0.0.1:8787/debug/stream/direct-upload | jq -r .uploadURL)
+jq --arg u "$DU" '. + {stream:{uploadURL:$u}}' payload.json > payload2.json
+
+# F) Call the renderer (Manim path)
+curl -s -X POST http://127.0.0.1:8000/render \
+  -H "Authorization: Bearer dev-render-token" \
+  -H "Content-Type: application/json" \
+  --data @payload2.json | jq
+
+
+
+
 
 
 

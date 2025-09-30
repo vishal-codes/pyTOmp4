@@ -1,60 +1,78 @@
+import { buildDetectPrompt, buildEventsPrompt, buildComplexityPrompt, buildNarrationPrompt, buildSyncPrompt } from "./prompts";
 import { zSyncPlan } from "../schemas/sync";
-import { buildSyncPrompt } from "./prompts";
+import { validateComplexity } from "../validate";
 
-export interface DetectOut {
-  algo_id: string;
-  confidence: number;
-  ds: string[];
+// at top of ai/client.ts
+// Wrap {system,user,json?} into Workers AI chat shape
+function toCFChatBody(p: { system?: string; user: string; json?: boolean }) {
+  const messages: Array<{ role: "system" | "user"; content: string }> = [];
+  if (p.system) messages.push({ role: "system", content: p.system });
+  messages.push({ role: "user", content: p.user });
+  const body: any = { messages };
+  if (p.json) body.response_format = { type: "json_object" };
+  return body;
 }
 
-export async function runDetect(env: any, code: string, language: string): Promise<DetectOut> {
-  // Stub for now; proves env vars are wired. Replace with real Workers AI call later.
-  return { algo_id: "rotated_binary_search", confidence: 0.92, ds: ["array"] };
+// Extract parsed JSON from Workers AI result regardless of variant
+function getAIJson(raw: any): any {
+  if (raw == null) throw new Error("AI returned empty response");
+
+  // If CF already returned a parsed object when we requested json_object
+  if (raw && typeof raw.response === "object" && raw.response !== null) {
+    return raw.response;
+  }
+
+  // Try common text fields
+  const candidates = [
+    typeof raw === "string" ? raw : undefined,
+    typeof raw.response === "string" ? raw.response : undefined,
+    typeof raw.output_text === "string" ? raw.output_text : undefined,
+    typeof raw.output === "string" ? raw.output : undefined,
+  ].filter(Boolean) as string[];
+
+  for (const t of candidates) {
+    const s = t.trim();
+    if (s.startsWith("{") || s.startsWith("[")) return JSON.parse(s);
+  }
+
+  // As a fallback, give validators the object directly
+  if (typeof raw === "object") return raw;
+
+  const prev = (typeof raw === "string" ? raw : JSON.stringify(raw)).slice(0, 400);
+  throw new Error(`Unable to extract JSON from AI response. Preview: ${prev}`);
 }
 
-export async function runEvents(env: any, _algoId: string, _code: string, _language: string) {
-  // Minimal valid storyboard stub (ArrayTape + ComplexityCard + ResultCard)
+export async function runDetect(env: any, code: string, language: string) {
+  const p = buildDetectPrompt(code, language);         // should set json: true
+  const raw = await env.AI.run(env.AI_MODEL_DETECT, toCFChatBody(p));
+  const obj = getAIJson(raw);
   return {
-    version: "1.0",
-    input: { nums: [4, 5, 6, 7, 0, 1, 2], target: 0 },
-    scenes: [
-      { t: "TitleCard", text: "Binary Search (Rotated)" },
-      { t: "ArrayTape", left: 0, right: 6, mid: 3 },
-      { t: "Callout", text: "Left half is sorted" },
-      { t: "MovePointer", which: "left", to: 4 },
-      { t: "ArrayTape", left: 4, right: 6, mid: 5 },
-      { t: "MovePointer", which: "right", to: 4 },
-      { t: "ArrayTape", left: 4, right: 4, mid: 4 },
-      { t: "ComplexityCard" },
-      { t: "ResultCard", text: "Found at index 4" }
-    ]
+    algo_id: typeof obj.algo_id === "string" ? obj.algo_id : "rotated_binary_search",
+    confidence: Number.isFinite(obj.confidence) ? obj.confidence : 0.7,
+    ds: Array.isArray(obj.ds) && obj.ds.length ? obj.ds : ["array"],
   };
 }
 
-export async function runNarration(_env: any, _algoId: string, _events: unknown) {
-  return {
-    version: "1.0",
-    lines: [
-      "We search a rotated sorted array using a binary search idea.",
-      "We pick the sorted half and keep only the possible half.",
-      "Here the target appears at index four.",
-      "Time is O(log n) and space is O(1)."
-    ]
-  };
+export async function runEvents(env: any, algoId: string, code: string, language: string) {
+  const p = buildEventsPrompt(algoId, code, language);
+  const raw = await env.AI.run(env.AI_MODEL_EVENTS, toCFChatBody(p));
+  return getAIJson(raw);
 }
 
-export async function runComplexity(_env: any, _algoId: string) {
-  return {
-    time: { best: "O(1)", avg: "O(log n)", worst: "O(log n)" },
-    space: { aux: "O(1)" },
-    explanation: "Binary-search style halves; only constant extra state."
-  };
+export async function runNarration(env: any, algoId: string, events: unknown) {
+  const p = buildNarrationPrompt(algoId, events);
+  const raw = await env.AI.run(env.AI_MODEL_NARRATION, toCFChatBody(p));
+  return getAIJson(raw);
+}
+
+export async function runComplexity(env: any, algoId: string) {
+  const p = buildComplexityPrompt(algoId);
+  const raw = await env.AI.run(env.AI_MODEL_NARRATION, toCFChatBody(p));
+  return getAIJson(raw);
 }
 
 export async function runSync(env: any, events: unknown, narration: { lines: string[] }) {
-  const prompt = buildSyncPrompt(events, narration);
-  const raw = await env.AI.run(env.AI_MODEL_NARRATION, prompt); 
-  const plan = JSON.parse(typeof raw === "string" ? raw : (raw.output_text || raw.output || "{}"));
-  return zSyncPlan.parse(plan);
+  const p = buildSyncPrompt(events, narration);
+  const raw = await env.AI.run(env.AI_MODEL_NARRATION, toCFChatBody(p));
+  return getAIJson(raw);
 }
-

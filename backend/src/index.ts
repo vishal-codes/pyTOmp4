@@ -12,7 +12,7 @@
  */
 import { runDetect, runEvents, runNarration, runComplexity, runSync } from "./ai/client";
 import { validateEventTrace, validateNarration, validateComplexity } from "./validate";
-import { buildDetectPrompt, buildEventsPrompt, buildNarrationPrompt, buildComplexityPrompt } from "./ai/prompts";
+import { buildDetectPrompt, buildEventsPrompt, buildNarrationPrompt, buildComplexityPrompt, buildSyncPrompt } from "./ai/prompts";
 import { specJSON } from "./spec/templates";
 import { runPrep } from "./prep";
 import { putJSON, putBytes } from "./r2";
@@ -41,6 +41,17 @@ export interface Env {
 }
 
 type JobStatus = "queued" | "prepping" | "ready_to_render" | "rendering" | "done" | "failed";
+// types you already have / expect
+type TTSOut = { bytes: Uint8Array; contentType: string; ext: string };
+
+// tiny helper (drop next to your PREP code)
+function normalizeTTS(out: TTSOut | Uint8Array): TTSOut {
+  if (out instanceof Uint8Array) {
+    return { bytes: out, contentType: "audio/wav", ext: "wav" };
+  }
+  // assume well-formed TTSOut
+  return out;
+}
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 
@@ -373,17 +384,99 @@ export default {
     });
   }
 
+  // inside your main request handler:
   if (req.method === "GET" && pathname === "/ai/prompts/preview") {
-    const sampleCode = "def search(nums, target): pass";
-    const lang = "python";
-    const detect = buildDetectPrompt(sampleCode, lang);
-    const events = buildEventsPrompt("rotated_binary_search", sampleCode, lang);
-    const narration = buildNarrationPrompt("rotated_binary_search", { version: "1.0", input:{}, scenes: [] });
-    const complexity = buildComplexityPrompt("rotated_binary_search");
-    return new Response(JSON.stringify({ detect, events, narration, complexity }, null, 2), {
-      headers: { "content-type": "application/json" }
+    const url = new URL(req.url);
+    const code =
+      url.searchParams.get("code") ||
+      `def search_rotated_sorted_array(nums, target):
+      left, right = 0, len(nums) - 1
+      while left <= right:
+          mid = (left + right) // 2
+          if nums[mid] == target:
+              return mid
+          if nums[left] <= nums[mid]:
+              if nums[left] <= target < nums[mid]:
+                  right = mid - 1
+              else:
+                  left = mid + 1
+          else:
+              if nums[mid] < target <= nums[right]:
+                  left = mid + 1
+              else:
+                  right = mid - 1
+      return -1`;
+    const language = url.searchParams.get("language") || "python";
+    const algo = url.searchParams.get("algo") || "rotated_binary_search";
+
+    // Local helper to convert our {system,user,json?} into Workers-AI chat shape
+    const toCFChatBody = (p: { system?: string; user: string; json?: boolean }) => {
+      const body: any = {
+        messages: [
+          ...(p.system ? [{ role: "system", content: p.system }] : []),
+          { role: "user", content: p.user },
+        ],
+      };
+      if (p.json) body.response_format = { type: "json_object" };
+      return body;
+    };
+
+    // Import these from your ai/prompts module at the top of the file:
+    //   import {
+    //     buildDetectPrompt,
+    //     buildEventsPrompt,
+    //     buildNarrationPrompt,
+    //     buildComplexityPrompt,
+    //     buildSyncPrompt
+    //   } from "./ai/prompts";
+
+    // A small, realistic storyboard stub so narration/sync prompts have context
+    const eventsStub = {
+      version: "1.0",
+      input: { nums: [4, 5, 6, 7, 0, 1, 2], target: 0 },
+      scenes: [
+        { t: "TitleCard", text: "Rotated Binary Search" },
+        { t: "ArrayTape", left: 0, right: 6, mid: 3 },
+        { t: "Callout", text: "Left half is sorted" },
+        { t: "MovePointer", which: "left", to: 4 },
+      ],
+    };
+
+    // A tiny narration stub for the sync prompt
+    const narrationStub = {
+      lines: [
+        "Let us walk through a rotated binary search to find 0.",
+        "We begin with indices 0 to 6 and midpoint 3 with value 7.",
+      ],
+    };
+
+    // Build raw prompts
+    const detectP = buildDetectPrompt(code, language);
+    const eventsP = buildEventsPrompt(algo, code, language);
+    const narrP   = buildNarrationPrompt(algo, eventsStub);
+    const complP  = buildComplexityPrompt(algo);
+    const syncP   = buildSyncPrompt(eventsStub, narrationStub);
+
+    // Also show the exact chat bodies you would send to env.AI.run(...)
+    const chatBodies = {
+      detect:     toCFChatBody(detectP),
+      events:     toCFChatBody(eventsP),
+      narration:  toCFChatBody(narrP),
+      complexity: toCFChatBody(complP),
+      sync:       toCFChatBody(syncP), // syncP.json already true inside builder
+    };
+
+    const payload = {
+      inputs: { algo, language, codePreview: code.slice(0, 280) + (code.length > 280 ? " …" : "") },
+      raw: { detect: detectP, events: eventsP, narration: narrP, complexity: complP, sync: syncP },
+      chat_bodies: chatBodies,
+    };
+
+    return new Response(JSON.stringify(payload, null, 2), {
+      headers: { "content-type": "application/json" },
     });
   }
+
 
   if (req.method === "GET" && pathname === "/ai/ping") {
     return new Response(
@@ -406,23 +499,90 @@ export default {
     return json({ ok: true, service: "code2video-api" });
   }
 
-  if (req.method === "GET" && pathname === "/ai/validate") {
-    const code = "def search(nums, target): pass";
-    const language = "python";
+// in backend/src/index.ts
+
+if (req.method === "GET" && pathname === "/ai/validate") {
+  const url = new URL(req.url);
+  const language = url.searchParams.get("language") || "python";
+  const code = url.searchParams.get("code") || `def search_rotated_sorted_array(nums, target):
+    left, right = 0, len(nums) - 1
+    while left <= right:
+        mid = (left + right) // 2
+        if nums[mid] == target:
+            return mid
+        if nums[left] <= nums[mid]:
+            if nums[left] <= target < nums[mid]:
+                right = mid - 1
+            else:
+                left = mid + 1
+        else:
+            if nums[mid] < target <= nums[right]:
+                left = mid + 1
+            else:
+                right = mid - 1
+    return -1`;
+
+  const out: any = { ok: false, steps: [] };
+
+  try {
+    // DETECT
     const det = await runDetect(env, code, language);
+    out.steps.push({ stage: "detect", ok: true, result: det });
+
+    // EVENTS
     const events = await runEvents(env, det.algo_id, code, language);
+    try {
+      validateEventTrace(events);
+      out.steps.push({ stage: "events", ok: true, scenes: events?.scenes?.length ?? 0 });
+    } catch (e: any) {
+      out.steps.push({ stage: "events-validate", ok: false, error: String(e?.message || e) });
+      return new Response(JSON.stringify(out, null, 2), { headers: { "content-type": "application/json" }, status: 400 });
+    }
+
+    // NARRATION
     const narration = await runNarration(env, det.algo_id, events);
+    try {
+      validateNarration(narration);
+      out.steps.push({ stage: "narration", ok: true, lines: narration?.lines?.length ?? 0 });
+    } catch (e: any) {
+      out.steps.push({ stage: "narration-validate", ok: false, error: String(e?.message || e) });
+      return new Response(JSON.stringify(out, null, 2), { headers: { "content-type": "application/json" }, status: 400 });
+    }
+
+    // COMPLEXITY
     const complexity = await runComplexity(env, det.algo_id);
+    try {
+      validateComplexity(complexity);
+      out.steps.push({ stage: "complexity", ok: true });
+    } catch (e: any) {
+      out.steps.push({ stage: "complexity-validate", ok: false, error: String(e?.message || e) });
+      return new Response(JSON.stringify(out, null, 2), { headers: { "content-type": "application/json" }, status: 400 });
+    }
 
-    // will throw if invalid
-    validateEventTrace(events);
-    validateNarration(narration);
-    validateComplexity(complexity);
+    // SYNC
+    const sync = await runSync(env, events, narration);
+    const scenes = events?.scenes?.length ?? 0;
+    const pairs = sync?.pairs?.length ?? -1;
+    out.steps.push({ stage: "sync", ok: true, pairs, scenes, length_ok: pairs === scenes });
+    if (pairs !== scenes) {
+      out.steps.push({ stage: "sync-validate", ok: false, error: `pairs.length (${pairs}) != scenes.length (${scenes})` });
+      return new Response(JSON.stringify(out, null, 2), { headers: { "content-type": "application/json" }, status: 400 });
+    }
 
-    return new Response(JSON.stringify({ ok: true, algo: det.algo_id }), {
-      headers: { "content-type": "application/json" },
-    });
+    out.ok = true;
+    return new Response(JSON.stringify(out, null, 2), { headers: { "content-type": "application/json" } });
+  } catch (err: any) {
+    const msg =
+      err instanceof Error
+        ? `${err.message}${err.stack ? "\n" + err.stack : ""}`
+        : typeof err === "string"
+        ? err
+        : JSON.stringify(err);
+    out.steps.push({ stage: "threw", ok: false, error: msg });
+    return new Response(JSON.stringify(out, null, 2), { headers: { "content-type": "application/json" }, status: 500 });
   }
+}
+
 
   // POST /api/jobs/:id/callback
   if (req.method === "POST" && pathname.startsWith("/api/jobs/") && pathname.endsWith("/callback")) {
@@ -549,54 +709,59 @@ async queue(batch: MessageBatch<any>, env: Env) {
         await putJSON(env.pytomp4_r2, `${base}/complexity.json`, complexity);
         await putJSON(env.pytomp4_r2, `${base}/sync.json`, syncPlan);
 
-        // --- NEW: ensure one line per scene ---
+        // after you have: events, narration, syncPlan
         const scenes: any[] = Array.isArray(events?.scenes)
           ? events.scenes
           : (Array.isArray(events) ? events : []);
-        let lines: string[] = Array.isArray(narration?.lines) ? narration.lines : [];
 
-        if (lines.length !== scenes.length || lines.length === 0) {
-          // fallback build from scenes (helper you added earlier)
-          lines = buildSceneLinesSmart(
+        let rawLines: string[] = Array.isArray(narration?.lines) ? narration.lines : [];
+        if (rawLines.length === 0) {
+          rawLines = buildSceneLinesSmart(
             scenes,
             events?.input?.nums as number[] | undefined,
             events?.input?.target as number | undefined
           );
         }
 
-        // persist narration (with ensured lines)
-        const narrOut = { ...(narration ?? {}), lines };
-        await putJSON(env.pytomp4_r2, `${base}/narration.json`, narrOut);
+        // normalize narration lines for TTS
+        const norm = (s: string) => normalizeNarrLine(String(s || ""));
 
-        // 4) TTS lines → WAVs in R2
-        const audioKeys: string[] = []; 
-        for (let i = 0; i < lines.length; i++) {
+        // build per-scene fused text using the sync plan
+        let pairs: number[][] = Array.isArray((syncPlan as any)?.pairs) ? (syncPlan as any).pairs : [];
+        if (pairs.length !== scenes.length) {
+          // fallback: 1:1 pairing, capped by shorter length
+          pairs = scenes.map((_, i) => (i < rawLines.length ? [i] : []));
+        }
+
+        // join lines per scene (empty array -> silence)
+        const fusedByScene: string[] = pairs.map(idxList =>
+          norm(idxList.map(i => rawLines[i]).filter(Boolean).join(" "))
+        );
+
+        // persist final narration we actually TTS
+        await putJSON(env.pytomp4_r2, `${base}/narration.json`, {
+          version: "1.0",
+          lines: fusedByScene
+        });
+
+        // TTS: one clip per scene, in order
+        const audioKeys: string[] = [];
+        for (let i = 0; i < fusedByScene.length; i++) {
+          const text = fusedByScene[i] || ""; // silence if empty
           let key = `${base}/audio/${String(i).padStart(3, "0")}.wav`;
           try {
-            const clip = await synthesizeLine(env, lines[i]); // <-- now returns bytes + metadata 
+            const clip0 = await synthesizeLine(env, text);
+            const clip = normalizeTTS(clip0);     
             const ext = (clip as any).ext ?? "wav";
             const ctype = (clip as any).contentType ?? "audio/wav";
-            key = `${base}/audio/${String(i).padStart(3,"0")}.${ext}`; 
-            await putBytes(env.pytomp4_r2, key, clip.bytes, ctype); // <-- use clip.contentType 
-          } catch (error) {
-            const silence = makeOneSecondSilenceWav(); 
+            key = `${base}/audio/${String(i).padStart(3, "0")}.${clip.ext}`
+            await putBytes(env.pytomp4_r2, key, clip.bytes, clip.contentType);  // ✅ uses bytes
+          } catch {
+            const silence = makeOneSecondSilenceWav();
             await putBytes(env.pytomp4_r2, key, new Uint8Array(silence), "audio/wav");
           }
-          audioKeys.push(key); 
+          audioKeys.push(key);
         }
-        
-        // const lines: string[] = narration.lines ?? [];
-        // const audioKeys: string[] = [];
-        // for (let i = 0; i < lines.length; i++) {
-        //   const clip = await synthesizeLine(env, lines[i]);
-        //   // If synthesizeLine returns raw bytes (Uint8Array), default to WAV:
-        //   const ext = (clip as any).ext ?? "wav";
-        //   const bytes = (clip as any).bytes ?? (clip as Uint8Array);
-        //   const contentType = (clip as any).contentType ?? "audio/wav";
-        //   const key = `${base}/audio/${String(i).padStart(3, "0")}.${ext}`;
-        //   await putBytes(env.pytomp4_r2, key, bytes, contentType);
-        //   audioKeys.push(key);
-        // }
 
         // 5) Create Stream Direct Upload
         const direct = await createDirectUpload(env as any, { meta: { jobId, algo: det.algo_id } } as any);
@@ -633,12 +798,21 @@ async queue(batch: MessageBatch<any>, env: Env) {
         });
 
         msg.ack();
-      } catch (err: any) {
-        console.error("PREP error", jobId, err?.message || err);
+     } catch (err: any) {
+        const err_msg =
+          err instanceof Error
+            ? `${err.message}${err.stack ? "\n" + err.stack : ""}`
+            : typeof err === "string"
+            ? err
+            : JSON.stringify(err);
+
+        console.error("PREP error", jobId, err_msg);
+
         await updateJob(env.pyTOmp4_d1, jobId, {
           status: "failed",
-          message: "prep failed validation"
+          message: err_msg.slice(0, 500) // store a trimmed, readable reason
         });
+
         msg.ack();
       }
     }
