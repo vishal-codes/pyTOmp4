@@ -10,7 +10,7 @@
  *
  * Learn more at https://developers.cloudflare.com/workers/
  */
-import { runDetect, runEvents, runNarration, runComplexity } from "./ai/client";
+import { runDetect, runEvents, runNarration, runComplexity, runSync } from "./ai/client";
 import { validateEventTrace, validateNarration, validateComplexity } from "./validate";
 import { buildDetectPrompt, buildEventsPrompt, buildNarrationPrompt, buildComplexityPrompt } from "./ai/prompts";
 import { specJSON } from "./spec/templates";
@@ -42,25 +42,18 @@ export interface Env {
 
 type JobStatus = "queued" | "prepping" | "ready_to_render" | "rendering" | "done" | "failed";
 
-
 const nowSec = () => Math.floor(Date.now() / 1000);
-
-// ---------- Helpers: scene → narration lines ----------
-type SceneLike = { t?: string; type?: string; [k: string]: any };
-
-function sceneName(s: SceneLike) {
-  return (s.t || s.type || "").toLowerCase();
-}
 
 function normalizeNarrLine(s: string) {
   return String(s)
     .replace(/:/g, " — ")
     .replace(/\s+/g, " ")
-    .replace(/\s*([,.;!?])\s*/g, "$1 ")
+    .replace(/\s*([,;!?])\s*/g, "$1 ")    // keep commas/semicolons spacing
+    .replace(/\s+\./g, ".")               // no space before periods
+    .replace(/\.{2,}/g, ".")              // collapse multi-dots
     .replace(/\s+$/,"")
-    .replace(/([^.?!])$/,"$1.");
+    .replace(/([^.?!])$/,"$1.");          // ensure sentence end
 }
-
 
 function buildSceneLinesSmart(events: any, nums?: number[], target?: number) {
   const scenes: any[] = Array.isArray(events?.scenes)
@@ -365,6 +358,7 @@ export default {
     const eventsUrl = await makeSignedUrl(env, `${base}/events.json`);
     const narrationUrl = await makeSignedUrl(env, `${base}/narration.json`);
     const complexityUrl = await makeSignedUrl(env, `${base}/complexity.json`);
+    const syncUrl = await makeSignedUrl(env, `${base}/sync.json`);
 
     // list audio keys and build signed URLs
     const list = await env.pytomp4_r2.list({ prefix: `${base}/audio/` });
@@ -374,7 +368,7 @@ export default {
     return json({
       jobId,
       algo_id: row?.algo ?? "unknown",
-      assets: { eventsUrl, narrationUrl, complexityUrl, audioUrls },
+      assets: { eventsUrl, narrationUrl, complexityUrl, audioUrls, syncUrl },
       note: "This mirrors the render queue payload (fresh signed URLs)."
     });
   }
@@ -547,11 +541,13 @@ async queue(batch: MessageBatch<any>, env: Env) {
 
         // 2) AI prep + validation
         const { det, events, narration, complexity } = await runPrep(env, code, language);
+        const syncPlan = await runSync(env, events, narration);
 
         // 3) Save JSON assets to R2
         const base = `jobs/${jobId}`;
         await putJSON(env.pytomp4_r2, `${base}/events.json`, events);
         await putJSON(env.pytomp4_r2, `${base}/complexity.json`, complexity);
+        await putJSON(env.pytomp4_r2, `${base}/sync.json`, syncPlan);
 
         // --- NEW: ensure one line per scene ---
         const scenes: any[] = Array.isArray(events?.scenes)
@@ -609,10 +605,11 @@ async queue(batch: MessageBatch<any>, env: Env) {
         const eventsUrl     = await makeSignedUrl(env, `${base}/events.json`);
         const narrationUrl  = await makeSignedUrl(env, `${base}/narration.json`);
         const complexityUrl = await makeSignedUrl(env, `${base}/complexity.json`);
+        const syncUrl      = await makeSignedUrl(env, `${base}/sync.json`);
         const audioUrls     = await Promise.all(audioKeys.map(k => makeSignedUrl(env, k)));
 
         // 7) Enqueue render job with signed URLs + uploadURL
-        console.log("RENDER_MSG", JSON.stringify({ jobId, algo_id: det.algo_id, assets: { eventsUrl, narrationUrl, complexityUrl, audioUrls }, stream: { uploadURL: direct.uploadURL } }));
+        console.log("RENDER_MSG", JSON.stringify({ jobId, algo_id: det.algo_id, assets: { eventsUrl, syncUrl, narrationUrl, complexityUrl, audioUrls }, stream: { uploadURL: direct.uploadURL } }));
         await env.py_to_mp4_render.send({
           jobId,
           algo_id: det.algo_id,
@@ -620,6 +617,7 @@ async queue(batch: MessageBatch<any>, env: Env) {
             eventsUrl,
             narrationUrl,
             complexityUrl,
+            syncUrl,
             audioUrls
           },
           stream: {

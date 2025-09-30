@@ -38,6 +38,7 @@ class Assets(BaseModel):
     eventsUrl: HttpUrl
     narrationUrl: HttpUrl
     complexityUrl: HttpUrl
+    syncUrl: HttpUrl
     audioUrls: List[HttpUrl] = Field(min_length=1)
 
 class StreamInfo(BaseModel):
@@ -331,24 +332,29 @@ def render(payload: RenderPayload, authorization: Optional[str] = Header(None)):
         except requests.RequestException as e:
             raise Fail(f"FETCH_ERROR: audio HEAD failed: {e}")
 
-        # ↓↓↓ everything happens inside this tempdir ↓↓↓
+        # everything happens inside this tempdir
         with tempfile.TemporaryDirectory() as td_str:
             td = Path(td_str)
 
             # Download JSON assets
-            ev = nar = cx = None
-            for kind, url in [
+            ev = nar = cx = syncp = None
+            for item in [
                 ("events", str(payload.assets.eventsUrl)),
                 ("narration", str(payload.assets.narrationUrl)),
                 ("complexity", str(payload.assets.complexityUrl)),
+                ("sync", str(payload.assets.syncUrl))
             ]:
                 try:
+                    if not item:
+                        continue
+                    kind, url = item
                     name = infer_asset_filename(url, default=f"{kind}.json")
                     dest = td / name
                     download(url, dest)
-                    if kind == "events": ev = dest
-                    elif kind == "narration": nar = dest
-                    else: cx = dest
+                    if   kind == "events":     ev = dest
+                    elif kind == "narration":  nar = dest
+                    elif kind == "complexity": cx = dest
+                    elif kind == "sync":       syncp = dest
                 except Exception as e:
                     print("WARN: JSON asset fetch failed:", url, e)
 
@@ -374,7 +380,7 @@ def render(payload: RenderPayload, authorization: Optional[str] = Header(None)):
             try:
                 use_manim = os.getenv("USE_MANIM", "1") == "1" and ev and audio_files
                 if use_manim:
-                    render_manim(ev, audio_files, out_mp4)
+                    render_manim(ev, audio_files, out_mp4, sync_json=syncp)
                 else:
                     total = sum((ffprobe_duration(p) or 2.0) for p in audio_files)
                     make_video(total, out_audio, out_mp4)

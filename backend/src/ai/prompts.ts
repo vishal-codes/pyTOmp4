@@ -64,13 +64,15 @@ Return JSON only with:
 }
 
 export function buildNarrationPrompt(algoId: string, events: unknown) {
-  const eventsPreview = JSON.stringify(events).slice(0, 4000); // cap to keep prompt small
+  const eventsPreview = JSON.stringify(events).slice(0, 4000);
   return {
     system:
-`You write very concise narration lines for a code-explanation video. Keep language simple.
-Output JSON only as: { "version":"1.0", "lines":[ "...", "...", ... ] }.
-3–8 lines total. Each line should map to one or more adjacent scenes.
-No line > 180 chars.`,
+`You are a calm, friendly teacher. Write short, natural sentences that sound like human speech.
+Constraints:
+- Output JSON only: { "version":"1.0", "lines":[ "...", ... ] }
+- 6–14 sentences total. Prefer 8–12 for typical problems.
+- No line > 180 chars. Avoid jargon. Use "we", "let’s".
+- Use punctuation to create natural pauses. Spell out big-O as "O(log n)".`,
     user:
 `Algorithm: ${algoId}
 Storyboard (truncated if long):
@@ -80,6 +82,7 @@ Return JSON only with { "version":"1.0", "lines":[ ... ] }`,
     json: true,
   };
 }
+
 
 export function buildComplexityPrompt(algoId: string) {
   return {
@@ -94,6 +97,32 @@ Output JSON only as:
     user:
 `Algorithm: ${algoId}
 Return JSON only.`,
+    json: true,
+  };
+}
+
+export function buildSyncPrompt(events: unknown, narration: { lines: string[] }) {
+  const scenesPreview = JSON.stringify(events).slice(0, 4000);
+  const narrPreview = JSON.stringify(narration).slice(0, 4000);
+  return {
+    system:
+`You align narration lines to storyboard scenes.
+Output JSON only:
+{ "version":"1.0", "pairs":[ lineIdx[] per scene ], "breath_gap_sec": 0.12 }
+Rules:
+- pairs.length MUST equal scenes.length.
+- Do NOT reorder lines; use original indices.
+- A scene may have 0, 1, or many lines.
+- Prefer combining short lines on meaningful visuals (e.g., pointer moves).
+- For very brief visuals (decorative Callout), use [] to keep silence.`,
+    user:
+`SCENES (truncated):
+${scenesPreview}
+
+NARRATION:
+${narrPreview}
+
+Return JSON only with {version,pairs,breath_gap_sec}.`,
     json: true,
   };
 }

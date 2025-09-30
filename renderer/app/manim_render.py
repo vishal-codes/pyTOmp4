@@ -1,15 +1,26 @@
 # renderer/app/manim_render.py
-import json, gzip, shutil, subprocess, os
+import json, tempfile, gzip, shutil, subprocess, os
 from pathlib import Path
 from typing import List, Dict, Any
 from manim import tempconfig
 from .normalizer import normalize_events
 from .mapping import coerce_args, apply_manim_defaults
-import tempfile
 
 MIN_SCENE = float(os.getenv("MIN_SCENE", "1.2"))
 TAIL_PAD  = float(os.getenv("TAIL_PAD", "0.25"))
 PACE_MULT = float(os.getenv("PACE_MULT", "1.0"))
+
+def _load_sync(sync_path: Path, scenes_count: int) -> dict:
+    if not sync_path.exists():
+        return {"pairs": [[i] for i in range(scenes_count)], "breath_gap_sec": 0.12}
+    with open(sync_path, "r") as f:
+        plan = json.load(f)
+    pairs = plan.get("pairs") or []
+    if len(pairs) != scenes_count:
+        # fallback: identity mapping
+        pairs = [[i] for i in range(scenes_count)]
+    gap = float(plan.get("breath_gap_sec", 0.12))
+    return {"pairs": pairs, "gap": max(0.0, min(2.0, gap))}
 
 def _pad_audio_to(a_in: Path, a_out: Path, target_sec: float):
     """Append silence if needed so audio >= target_sec."""
@@ -84,7 +95,7 @@ def _render_scene(SceneCls, args: Dict[str,Any], duration: float, out_mp4: Path)
 def _mux(video: Path, audio: Path, out_path: Path):
     subprocess.check_call([
         "ffmpeg","-y","-i",str(video),"-i",str(audio),
-        "-c:v","libx264","-pix_fmt","yuv420p","-c:a","aac",
+        "-c:v","libx264","-pix_fmt","yuv420p","-c:a","aac","-shortest",
         str(out_path)
     ])
 
@@ -98,21 +109,72 @@ def _concat(clips: List[Path], out_path: Path):
         "-c:v","libx264","-pix_fmt","yuv420p","-c:a","aac", str(out_path)
     ])
 
-def render_manim(events_json: Path, audio_files: List[Path], out_mp4: Path):
+def _synthesize_silence(seconds: float, out_audio: Path):
+    # generate a tiny silence (stereo 48k) once per needed duration
+    subprocess.check_call([
+        "ffmpeg","-y","-f","lavfi","-i",f"anullsrc=channel_layout=stereo:sample_rate=48000",
+        "-t",f"{seconds:.3f}","-c:a","aac","-b:a","160k", str(out_audio)
+    ])
+
+def _concat_audios(audios: list[Path], gap_sec: float, out_audio: Path):
+    # Create a concat list. If gap_sec > 0, insert synthetic silence between clips.
+    items = []
+    if not audios:
+        _synthesize_silence(0.6, out_audio)  # default silent placeholder
+        return
+    tmpdir = out_audio.parent
+    if gap_sec > 0 and len(audios) > 1:
+        sil = tmpdir / f"sil_{int(gap_sec*1000)}.m4a"
+        if not sil.exists():
+            _synthesize_silence(gap_sec, sil)
+        # build interleaved [a1, sil, a2, sil, ..., an]
+        for i, a in enumerate(audios):
+            items.append(a)
+            if i+1 < len(audios):
+                items.append(sil)
+    else:
+        items = list(audios)
+
+    lst = out_audio.with_suffix(".concat.txt")
+    with open(lst, "w") as f:
+        for p in items:
+            f.write(f"file '{p.as_posix()}'\n")
+
+    subprocess.check_call([
+        "ffmpeg","-y","-f","concat","-safe","0","-i",str(lst),
+        "-c:a","aac","-b:a","160k", str(out_audio)
+    ])
+
+def render_manim(events_json: Path, audio_files: List[Path], out_mp4: Path, sync_json: Path|None=None):
     apply_manim_defaults()
 
     raw = _load_events_any(events_json)
+    root = raw if isinstance(raw, dict) else None
     events = normalize_events(raw)
 
-    pairs = list(zip(events, audio_files))[:min(len(events), len(audio_files))]
-    if not pairs:
+    # --- NEW: sync plan
+    sync = _load_sync(sync_json or Path(""), len(events))
+    pairs, gap = sync["pairs"], sync["gap"]
+
+    # build per-scene audio by concatenating line clips per pair
+    grouped_audio: List[Path] = []
+    scratch = out_mp4.parent
+    for i, line_ids in enumerate(pairs):
+        # map narration indices to local audio files (skip OOB safely)
+        parts = [audio_files[j] for j in line_ids if 0 <= j < len(audio_files)]
+        out_a = scratch / f"group_{i:03d}.m4a"
+        _concat_audios(parts, gap, out_a)
+        grouped_audio.append(out_a)
+
+    pairs2 = list(zip(events, grouped_audio))[:min(len(events), len(grouped_audio))]
+    if not pairs2:
         raise RuntimeError("no events/audio pairs")
 
     clips: List[Path] = []
     ok = 0
-    for i, (ev, aud) in enumerate(pairs):
+    for i, (ev, aud) in enumerate(pairs2):
         try:
-            SceneCls, args = coerce_args(ev)
+            SceneCls, args = coerce_args(ev, events_root=root)
             a_dur = max(0.2, _ffprobe_duration(aud))
             d = max(MIN_SCENE, a_dur + TAIL_PAD)
 
@@ -125,8 +187,7 @@ def render_manim(events_json: Path, audio_files: List[Path], out_mp4: Path):
             _pad_audio_to(aud, padded, d * PACE_MULT)
             _mux(vid, padded, av)
 
-            clips.append(av)
-            ok += 1
+            clips.append(av); ok += 1
         except Exception as e:
             print(f"WARN: scene {i} failed: {e}")
             d = max(MIN_SCENE, _ffprobe_duration(aud) + TAIL_PAD)
@@ -141,4 +202,3 @@ def render_manim(events_json: Path, audio_files: List[Path], out_mp4: Path):
     if ok == 0:
         raise RuntimeError("no scenes rendered")
     _concat(clips, out_mp4)
-

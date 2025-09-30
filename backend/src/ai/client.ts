@@ -1,3 +1,6 @@
+import { zSyncPlan } from "../schemas/sync";
+import { buildSyncPrompt } from "./prompts";
+
 export interface DetectOut {
   algo_id: string;
   confidence: number;
@@ -47,3 +50,11 @@ export async function runComplexity(_env: any, _algoId: string) {
     explanation: "Binary-search style halves; only constant extra state."
   };
 }
+
+export async function runSync(env: any, events: unknown, narration: { lines: string[] }) {
+  const prompt = buildSyncPrompt(events, narration);
+  const raw = await env.AI.run(env.AI_MODEL_NARRATION, prompt); 
+  const plan = JSON.parse(typeof raw === "string" ? raw : (raw.output_text || raw.output || "{}"));
+  return zSyncPlan.parse(plan);
+}
+
